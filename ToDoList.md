@@ -31,7 +31,7 @@ CS2). Полное ТЗ — `TECHNICAL_SPEC.md`, конвенции разраб
   содержательным описанием + `git push` сразу после. Не батчить несколько
   этапов в один коммит.
 
-## Сделано (этапы 1-7, все запушены)
+## Сделано (этапы 1-8, все запушены)
 
 1. **Структура репозитория** — `app/`, `dashboard/`, `data/`, `tests/`,
    requirements.txt, .env.example, .gitignore.
@@ -105,20 +105,43 @@ CS2). Полное ТЗ — `TECHNICAL_SPEC.md`, конвенции разраб
     буквальный текст-плейсхолдер вместо пустого значения, из-за чего OpenDota
     API отвечал 400 на любой запрос. Исправлено на пустое значение (ключ и
     не нужен, см. CLAUDE.md).
-- **API-заглушка не трогалась**: `app/api.py`, `dashboard/app.py`,
-  `tests/*` — по-прежнему пустые файлы-заглушки из этапа 1.
+11. **`app/api.py`** — FastAPI поверх БД, ровно 5 эндпоинтов из ТЗ 5.7:
+    `GET /players` (фильтры `game` обязателен, `cluster`, `min_rating`,
+    `max_rating` — рейтинг и кластер подтягиваются через новые
+    `rating.latest_ratings()`/`clustering.latest_clusters()`), `GET
+    /players/{id}/history` (снапшоты + вся история рейтинга по времени, 404
+    если игрока нет), `GET /clusters` (последняя по времени запись кластера
+    каждого игрока через новую `clustering.latest_cluster_rows()`), `POST
+    /team/optimize` (тело — game + опциональные team_size/max_per_cluster/
+    min_clusters/active_days, в ответе — состав с ником/ролью/кластером
+    каждого игрока, а не только id), `POST /refresh` (game опционален, по
+    умолчанию — оба источника; вызывает ingest → compute_ratings →
+    compute_clusters). Планировщик стартует через `lifespan()` на старте
+    приложения (`create_scheduler().start()`), корректно останавливается на
+    shutdown.
+    - Попутный рефакторинг: `optimizer._latest_ratings`/`optimizer._latest_clusters`
+      дублировали SQL, нужный и API — вынесены в публичные
+      `rating.latest_ratings()`/`latest_rating_rows()` и
+      `clustering.latest_clusters()`/`latest_cluster_rows()`, `optimizer.py`
+      теперь их переиспользует вместо своих копий.
+    - Решение, не прописанное дословно в ТЗ 5.7: `/refresh` намеренно
+      пересчитывает и кластеры, не только рейтинг (в отличие от
+      `scheduler.py`, где джобы зовут только `compute_ratings` — см. этап 7)
+      — иначе после ручного "обновить данные" на защите CS2-оптимизатор
+      остался бы на устаревших кластерах. `scheduler.py` не менялся.
+    - Проверено: `TestClient` с замоканным `create_scheduler` (чтобы не
+      дёргать реальные API на каждый smoke-запуск) — все 5 эндпоинтов, 400 на
+      неизвестной игре, 404 на несуществующем игроке, infeasible-ветки
+      `/team/optimize`. Отдельно — один полный живой прогон `POST /refresh`
+      без мока ingest (реальные OpenDota/FACEIT) на чистой БД: 20 dota2 + 50
+      cs2 снапшотов, рейтинги и кластеры посчитаны, видны через `GET
+      /players`/`GET /clusters`.
+- **Заглушки не трогались**: `dashboard/app.py`, `tests/*` — по-прежнему
+  пустые файлы-заглушки из этапа 1.
 
 ## Дальше по плану (ТЗ раздел 9)
 
-### Этап 8 — `app/api.py` (FastAPI), СЛЕДУЮЩИЙ ШАГ
-
-- `GET /players`, `GET /players/{id}/history`, `GET /clusters`,
-  `POST /team/optimize`, `POST /refresh`.
-- Здесь же — старт `create_scheduler()` из `app/scheduler.py` на
-  startup-хуке приложения (сейчас `create_scheduler()` только собирает
-  scheduler, не стартует — по дизайну, см. коммит этапа 4).
-
-### Этап 9 — `dashboard/app.py` (Streamlit)
+### Этап 9 — `dashboard/app.py` (Streamlit), СЛЕДУЮЩИЙ ШАГ
 
 Таблица игроков с фильтрами, визуализация кластеров (использовать
 `clustering.pca_2d()`), график рейтинга по времени, форма запроса состава,

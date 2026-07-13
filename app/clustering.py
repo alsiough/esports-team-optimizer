@@ -8,6 +8,7 @@ from sklearn.cluster import DBSCAN, KMeans
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models import Cluster, Player, PlayerSnapshot
@@ -93,6 +94,30 @@ def compute_clusters(
         )
     session.commit()
     return len(df)
+
+
+def latest_cluster_rows(session: Session, game: str) -> list[Cluster]:
+    """Последняя по времени запись кластера каждого игрока данной игры (для API/дашборда/оптимизатора)."""
+    latest = (
+        session.query(Cluster.player_id, func.max(Cluster.computed_at).label("latest_computed_at"))
+        .join(Player)
+        .filter(Player.game == game)
+        .group_by(Cluster.player_id)
+        .subquery()
+    )
+    return (
+        session.query(Cluster)
+        .join(
+            latest,
+            (latest.c.player_id == Cluster.player_id) & (latest.c.latest_computed_at == Cluster.computed_at),
+        )
+        .all()
+    )
+
+
+def latest_clusters(session: Session, game: str) -> dict[int, int]:
+    """player_id -> последняя метка кластера для игры."""
+    return {c.player_id: c.cluster_label for c in latest_cluster_rows(session, game)}
 
 
 def detect_outliers_dbscan(

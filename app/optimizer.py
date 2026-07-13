@@ -21,7 +21,9 @@ import pulp
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models import Cluster, Player, PlayerSnapshot, Rating, TeamProposal
+from app.clustering import latest_clusters
+from app.models import Player, PlayerSnapshot, TeamProposal
+from app.rating import latest_ratings
 
 TEAM_SIZE = 5
 DEFAULT_MAX_PER_CLUSTER = 2
@@ -135,51 +137,13 @@ def _active_player_ids(session: Session, game: str, cutoff: dt.datetime) -> set[
     return {player_id for (player_id,) in rows}
 
 
-def _latest_ratings(session: Session, game: str) -> dict[int, float]:
-    latest = (
-        session.query(Rating.player_id, func.max(Rating.computed_at).label("latest_computed_at"))
-        .join(Player)
-        .filter(Player.game == game)
-        .group_by(Rating.player_id)
-        .subquery()
-    )
-    rows = (
-        session.query(Rating.player_id, Rating.rating_value)
-        .join(
-            latest,
-            (latest.c.player_id == Rating.player_id) & (latest.c.latest_computed_at == Rating.computed_at),
-        )
-        .all()
-    )
-    return dict(rows)
-
-
-def _latest_clusters(session: Session, game: str) -> dict[int, int]:
-    latest = (
-        session.query(Cluster.player_id, func.max(Cluster.computed_at).label("latest_computed_at"))
-        .join(Player)
-        .filter(Player.game == game)
-        .group_by(Cluster.player_id)
-        .subquery()
-    )
-    rows = (
-        session.query(Cluster.player_id, Cluster.cluster_label)
-        .join(
-            latest,
-            (latest.c.player_id == Cluster.player_id) & (latest.c.latest_computed_at == Cluster.computed_at),
-        )
-        .all()
-    )
-    return dict(rows)
-
-
 def _gather_candidates(session: Session, game: str, active_days: int) -> list[Candidate]:
     """Активные кандидаты игры: снапшот не старше active_days, есть посчитанный
     рейтинг, для Dota 2 - определена роль, для CS2 - есть кластер (ТЗ 5.5)."""
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=active_days)
     active_ids = _active_player_ids(session, game, cutoff)
-    ratings = _latest_ratings(session, game)
-    clusters = _latest_clusters(session, game) if game == "cs2" else {}
+    ratings = latest_ratings(session, game)
+    clusters = latest_clusters(session, game) if game == "cs2" else {}
 
     candidates = []
     for player in session.query(Player).filter(Player.game == game).all():

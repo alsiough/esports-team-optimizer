@@ -65,6 +65,30 @@ def _zscore_by_group(df: pd.DataFrame, metric_cols: list[str], group_col: str | 
     return z
 
 
+def latest_rating_rows(session: Session, game: str) -> list[Rating]:
+    """Последняя по времени запись рейтинга каждого игрока данной игры (для API/дашборда/оптимизатора)."""
+    latest = (
+        session.query(Rating.player_id, func.max(Rating.computed_at).label("latest_computed_at"))
+        .join(Player)
+        .filter(Player.game == game)
+        .group_by(Rating.player_id)
+        .subquery()
+    )
+    return (
+        session.query(Rating)
+        .join(
+            latest,
+            (latest.c.player_id == Rating.player_id) & (latest.c.latest_computed_at == Rating.computed_at),
+        )
+        .all()
+    )
+
+
+def latest_ratings(session: Session, game: str) -> dict[int, float]:
+    """player_id -> последнее значение rating_value для игры."""
+    return {r.player_id: r.rating_value for r in latest_rating_rows(session, game)}
+
+
 def compute_ratings(session: Session, game: str, rating_version: str = RATING_VERSION) -> int:
     """Пересчитывает рейтинг всех игроков игры по последнему снапшоту каждого.
 
