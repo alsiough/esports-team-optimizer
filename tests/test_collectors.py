@@ -117,6 +117,31 @@ class TestFaceitCollector:
         assert raw["player_id"] == "player-1"
         assert raw["stats"] == {"lifetime": {"Win Rate %": "50"}}
 
+    def test_fetch_player_pool_merges_multiple_regions_round_robin(self, monkeypatch):
+        catalog = {
+            "EU": [{"player_id": "eu1", "nickname": "a"}, {"player_id": "eu2", "nickname": "b"}],
+            "NA": [{"player_id": "na1", "nickname": "c"}],
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            region = request.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(200, json={"items": catalog[region]})
+
+        _install_mock_transport(monkeypatch, handler)
+        collector = FaceitCollector(api_key="secret-key", regions=["EU", "NA"])
+        pool = collector.fetch_player_pool()
+        # вперемешку (round-robin), а не сначала весь EU, потом весь NA - иначе
+        # обрезка пула до pool_limit в scheduler.ingest() забрала бы только EU
+        assert [item["player_id"] for item in pool] == ["eu1", "na1", "eu2"]
+
+    def test_fetch_player_pool_dedups_across_regions(self, monkeypatch):
+        _install_mock_transport(
+            monkeypatch, lambda request: httpx.Response(200, json={"items": [{"player_id": "dup", "nickname": "x"}]})
+        )
+        collector = FaceitCollector(api_key="secret-key", regions=["EU", "NA"])
+        pool = collector.fetch_player_pool()
+        assert pool == [{"player_id": "dup", "nickname": "x"}]
+
 
 class _EmptyPoolCollector:
     game = "dota2"

@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.clustering import compute_clusters
 from app.collectors.base import BaseCollector, SourceUnavailableError
+from app.collectors.faceit import KNOWN_REGIONS as CS2_KNOWN_REGIONS
 from app.collectors.faceit import FaceitCollector
 from app.collectors.opendota import OpenDotaCollector
 from app.db import get_session
@@ -131,11 +132,19 @@ def ingest_cs2(session: Session, collector: FaceitCollector, pool_limit: int | N
 # опрашивать его целиком каждый цикл нельзя (см. TECHNICAL_SPEC.md 11), поэтому
 # планировщик берёт ограниченный срез пула за один запуск. Интервалы и размеры
 # срезов - конфигурируемые, чтобы их можно было подстроить без правки кода.
+# DOTA2_POOL_LIMIT=30 при интервале 60 минут и 3 запросах на игрока (wl/totals/matches)
+# даёт ~91 запрос/опрос - с запасом укладывается в лимит 60/мин; для непрерывной
+# работы 24/7 это ближе к верхней границе месячного бюджета, но локальный
+# демо-проект так не работает - см. ToDoList.md.
 DOTA2_POLL_INTERVAL_MINUTES = int(os.getenv("DOTA2_POLL_INTERVAL_MINUTES", "60"))
-DOTA2_POOL_LIMIT = int(os.getenv("DOTA2_POOL_LIMIT", "20"))
+DOTA2_POOL_LIMIT = int(os.getenv("DOTA2_POOL_LIMIT", "30"))
 CS2_POLL_INTERVAL_MINUTES = int(os.getenv("CS2_POLL_INTERVAL_MINUTES", "60"))
-CS2_POOL_LIMIT = int(os.getenv("CS2_POOL_LIMIT", "50"))
-CS2_REGION = os.getenv("FACEIT_REGION", "EU")
+CS2_POOL_LIMIT = int(os.getenv("CS2_POOL_LIMIT", "100"))
+# Список регионов через запятую - FaceitCollector объединяет их топ-рейтинги
+# вперемешку (round-robin), см. app/collectors/faceit.py:KNOWN_REGIONS.
+CS2_REGIONS = [
+    r.strip() for r in os.getenv("FACEIT_REGIONS", ",".join(CS2_KNOWN_REGIONS)).split(",") if r.strip()
+]
 
 
 @dataclass
@@ -151,7 +160,7 @@ def refresh_game(
     *,
     dota2_pool_limit: int = DOTA2_POOL_LIMIT,
     cs2_pool_limit: int = CS2_POOL_LIMIT,
-    cs2_region: str = CS2_REGION,
+    cs2_regions: list[str] = CS2_REGIONS,
 ) -> RefreshOutcome:
     """Внеочередной опрос источника game + пересчёт рейтинга и кластеров.
 
@@ -165,7 +174,7 @@ def refresh_game(
         api_key = os.getenv("FACEIT_API_KEY")
         if not api_key:
             raise RuntimeError("cs2: FACEIT_API_KEY не задан")
-        stored = ingest_cs2(session, FaceitCollector(api_key=api_key, region=cs2_region), pool_limit=cs2_pool_limit)
+        stored = ingest_cs2(session, FaceitCollector(api_key=api_key, regions=cs2_regions), pool_limit=cs2_pool_limit)
     else:
         raise ValueError(f"неизвестная игра: {game}")
 
@@ -199,7 +208,7 @@ def _job_ingest_cs2() -> None:
         return
     session = get_session()
     try:
-        collector = FaceitCollector(api_key=api_key, region=CS2_REGION)
+        collector = FaceitCollector(api_key=api_key, regions=CS2_REGIONS)
         stored = ingest_cs2(session, collector, pool_limit=CS2_POOL_LIMIT)
         logger.info("cs2: job завершён, снапшотов сохранено: %s", stored)
         if stored:
