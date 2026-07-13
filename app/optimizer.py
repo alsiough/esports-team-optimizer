@@ -26,8 +26,8 @@ from app.models import Player, PlayerSnapshot, TeamProposal
 from app.rating import latest_ratings
 
 TEAM_SIZE = 5
-DEFAULT_MAX_PER_CLUSTER = 2
-DEFAULT_MIN_CLUSTERS = 3
+DEFAULT_MAX_PER_CLUSTER = 3
+DEFAULT_MIN_CLUSTERS = 2
 DEFAULT_ACTIVE_DAYS = 30
 DOTA2_ROLES = [str(r) for r in range(1, 6)]
 

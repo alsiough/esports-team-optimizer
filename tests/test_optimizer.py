@@ -66,14 +66,16 @@ class TestOptimizeCandidatesCs2:
         ]
 
     def test_respects_max_per_cluster_and_min_clusters(self):
-        result = optimize_candidates(self._candidates(), "cs2")
+        # значения переданы явно, а не через дефолты - тест проверяет само
+        # ограничение, а не то, чему сейчас равен DEFAULT_MAX_PER_CLUSTER/DEFAULT_MIN_CLUSTERS
+        result = optimize_candidates(self._candidates(), "cs2", max_per_cluster=2, min_clusters=3)
         assert result.feasible
         assert sorted(result.player_ids) == [1, 2, 4, 5, 6]
         assert result.objective_value == pytest.approx(25.0)
 
     def test_min_clusters_unreachable_is_infeasible(self):
         candidates = [c for c in self._candidates() if c.cluster_label != 2]  # только 2 кластера
-        result = optimize_candidates(candidates, "cs2")
+        result = optimize_candidates(candidates, "cs2", min_clusters=3)
         assert not result.feasible
 
     def test_max_per_cluster_too_small_is_infeasible(self):

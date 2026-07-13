@@ -21,7 +21,7 @@ MATCH_PROJECT_FIELDS = [
     "radiant_win",
     "player_slot",
 ]
-MATCHES_LIMIT = 30
+MATCHES_LIMIT = 100
 
 
 class OpenDotaCollector(BaseCollector):
