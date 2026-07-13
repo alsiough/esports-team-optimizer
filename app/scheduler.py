@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import httpx
@@ -11,6 +12,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.orm import Session
 
+from app.clustering import compute_clusters
 from app.collectors.base import BaseCollector, SourceUnavailableError
 from app.collectors.faceit import FaceitCollector
 from app.collectors.opendota import OpenDotaCollector
@@ -136,7 +138,47 @@ CS2_POOL_LIMIT = int(os.getenv("CS2_POOL_LIMIT", "50"))
 CS2_REGION = os.getenv("FACEIT_REGION", "EU")
 
 
+@dataclass
+class RefreshOutcome:
+    snapshots_stored: int
+    players_rated: int
+    players_clustered: int
+
+
+def refresh_game(
+    session: Session,
+    game: str,
+    *,
+    dota2_pool_limit: int = DOTA2_POOL_LIMIT,
+    cs2_pool_limit: int = CS2_POOL_LIMIT,
+    cs2_region: str = CS2_REGION,
+) -> RefreshOutcome:
+    """Внеочередной опрос источника game + пересчёт рейтинга и кластеров.
+
+    Общая точка входа для планового job'а, POST /refresh (app/api.py) и
+    кнопки "Опросить источник" в дашборде - без неё ingest+compute_ratings+
+    compute_clusters дублировались бы в каждом из мест по отдельности.
+    """
+    if game == "dota2":
+        stored = ingest_dota2(session, pool_limit=dota2_pool_limit)
+    elif game == "cs2":
+        api_key = os.getenv("FACEIT_API_KEY")
+        if not api_key:
+            raise RuntimeError("cs2: FACEIT_API_KEY не задан")
+        stored = ingest_cs2(session, FaceitCollector(api_key=api_key, region=cs2_region), pool_limit=cs2_pool_limit)
+    else:
+        raise ValueError(f"неизвестная игра: {game}")
+
+    rated = compute_ratings(session, game) if stored else 0
+    clustered = compute_clusters(session, game) if stored else 0
+    return RefreshOutcome(snapshots_stored=stored, players_rated=rated, players_clustered=clustered)
+
+
 def _job_ingest_dota2() -> None:
+    # Плановый job намеренно пересчитывает только рейтинг, не кластеры -
+    # кластеризация тяжелее и не обязана поспевать за каждым интервалом
+    # опроса; см. refresh_game() выше для сценариев (API/дашборд), где нужен
+    # полный пересчёт по требованию.
     session = get_session()
     try:
         stored = ingest_dota2(session, pool_limit=DOTA2_POOL_LIMIT)

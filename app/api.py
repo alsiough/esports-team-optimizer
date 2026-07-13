@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -19,8 +18,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.clustering import compute_clusters, latest_cluster_rows, latest_clusters
-from app.collectors.faceit import FaceitCollector
+from app.clustering import latest_cluster_rows, latest_clusters
 from app.db import get_session, init_db
 from app.models import Player, PlayerSnapshot, Rating
 from app.optimizer import (
@@ -30,15 +28,8 @@ from app.optimizer import (
     TEAM_SIZE,
     optimize_team,
 )
-from app.rating import compute_ratings, latest_ratings
-from app.scheduler import (
-    CS2_POOL_LIMIT,
-    CS2_REGION,
-    DOTA2_POOL_LIMIT,
-    create_scheduler,
-    ingest_cs2,
-    ingest_dota2,
-)
+from app.rating import latest_ratings
+from app.scheduler import create_scheduler, refresh_game
 
 logger = logging.getLogger(__name__)
 
@@ -278,20 +269,21 @@ def team_optimize(payload: TeamOptimizeRequest, db: Session = Depends(get_db)) -
 
 
 def _refresh_one(db: Session, game: str) -> RefreshResult:
-    if game == "dota2":
-        stored = ingest_dota2(db, pool_limit=DOTA2_POOL_LIMIT)
-    else:
-        api_key = os.getenv("FACEIT_API_KEY")
-        if not api_key:
-            raise HTTPException(status_code=503, detail="cs2: FACEIT_API_KEY не задан")
-        stored = ingest_cs2(db, FaceitCollector(api_key=api_key, region=CS2_REGION), pool_limit=CS2_POOL_LIMIT)
-
-    rated = compute_ratings(db, game) if stored else 0
-    # Кластеризация не завязана на планировщик (см. app/scheduler.py), но
-    # /refresh должен готовить данные к демонстрации целиком - без неё CS2
-    # оптимизатор (нужен кластер каждого игрока) остался бы на устаревших данных.
-    clustered = compute_clusters(db, game) if stored else 0
-    return RefreshResult(game=game, snapshots_stored=stored, players_rated=rated, players_clustered=clustered)
+    # Кластеризация не завязана на плановый job планировщика (см.
+    # app/scheduler.py), но /refresh должен готовить данные к демонстрации
+    # целиком - без неё CS2-оптимизатор (нужен кластер каждого игрока)
+    # остался бы на устаревших данных, поэтому refresh_game() пересчитывает
+    # и рейтинг, и кластеры.
+    try:
+        outcome = refresh_game(db, game)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return RefreshResult(
+        game=game,
+        snapshots_stored=outcome.snapshots_stored,
+        players_rated=outcome.players_rated,
+        players_clustered=outcome.players_clustered,
+    )
 
 
 @app.post("/refresh", response_model=RefreshResponse)
