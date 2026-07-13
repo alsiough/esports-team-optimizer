@@ -102,10 +102,12 @@ def ingest(
 
 
 def ingest_dota2(session: Session, collector: OpenDotaCollector | None = None, pool_limit: int | None = None) -> int:
+    # OPENDOTA_API_KEY опционален (в отличие от FACEIT_API_KEY) - публичный
+    # лимит и без ключа работает, ключ только поднимает лимиты (см. CLAUDE.md)
     return ingest(
         session,
         game="dota2",
-        collector=collector or OpenDotaCollector(),
+        collector=collector or OpenDotaCollector(api_key=os.getenv("OPENDOTA_API_KEY")),
         normalize_player=normalize_opendota_player,
         normalize_snapshot=normalize_opendota_snapshot,
         pool_limit=pool_limit,
