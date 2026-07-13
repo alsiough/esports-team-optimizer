@@ -22,6 +22,7 @@ from app.normalize import (
     normalize_opendota_player,
     normalize_opendota_snapshot,
 )
+from app.rating import compute_ratings
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +139,9 @@ def _job_ingest_dota2() -> None:
     try:
         stored = ingest_dota2(session, pool_limit=DOTA2_POOL_LIMIT)
         logger.info("dota2: job завершён, снапшотов сохранено: %s", stored)
+        if stored:
+            rated = compute_ratings(session, "dota2")
+            logger.info("dota2: рейтинг пересчитан для %s игроков", rated)
     except Exception:
         logger.exception("dota2: job упал с ошибкой")
     finally:
@@ -154,6 +158,9 @@ def _job_ingest_cs2() -> None:
         collector = FaceitCollector(api_key=api_key, region=CS2_REGION)
         stored = ingest_cs2(session, collector, pool_limit=CS2_POOL_LIMIT)
         logger.info("cs2: job завершён, снапшотов сохранено: %s", stored)
+        if stored:
+            rated = compute_ratings(session, "cs2")
+            logger.info("cs2: рейтинг пересчитан для %s игроков", rated)
     except Exception:
         logger.exception("cs2: job упал с ошибкой")
     finally:
