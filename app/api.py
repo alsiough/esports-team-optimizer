@@ -28,8 +28,8 @@ from app.optimizer import (
     TEAM_SIZE,
     optimize_team,
 )
-from app.rating import latest_ratings
-from app.scheduler import create_scheduler, refresh_game
+from app.rating import latest_ratings, latest_snapshots
+from app.scheduler import BELOW_POOL_THRESHOLD_KEY, create_scheduler, refresh_game
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +82,7 @@ class PlayerBase(BaseModel):
 class PlayerOut(PlayerBase):
     rating: float | None = None
     cluster_label: int | None = None
+    below_pool_threshold: bool = False
 
 
 def _player_base(player: Player) -> PlayerBase:
@@ -97,8 +98,24 @@ def _player_base(player: Player) -> PlayerBase:
     )
 
 
-def _player_out(player: Player, rating: float | None, cluster_label: int | None) -> PlayerOut:
-    return PlayerOut(**_player_base(player).model_dump(), rating=rating, cluster_label=cluster_label)
+def _player_out(
+    player: Player, rating: float | None, cluster_label: int | None, below_pool_threshold: bool = False
+) -> PlayerOut:
+    return PlayerOut(
+        **_player_base(player).model_dump(),
+        rating=rating,
+        cluster_label=cluster_label,
+        below_pool_threshold=below_pool_threshold,
+    )
+
+
+def _below_pool_threshold_flags(session: Session, game: str) -> dict[int, bool]:
+    """player_id -> помечен ли последний снапшот как добавленный донабором роли
+    (см. app/scheduler.py::_backfill_missing_roles - актуально только для Dota 2)."""
+    return {
+        player.id: bool(snapshot.metrics.get(BELOW_POOL_THRESHOLD_KEY))
+        for player, snapshot in latest_snapshots(session, game)
+    }
 
 
 class SnapshotOut(BaseModel):
@@ -140,6 +157,7 @@ class TeamMemberOut(BaseModel):
     rating: float
     role: str | None
     cluster_label: int | None
+    below_pool_threshold: bool = False
 
 
 class TeamOptimizeResponse(BaseModel):
@@ -176,6 +194,7 @@ def list_players(
     _check_game(game)
     ratings = latest_ratings(db, game)
     clusters = latest_clusters(db, game)
+    below_threshold = _below_pool_threshold_flags(db, game)
 
     result = []
     for player in db.query(Player).filter(Player.game == game).order_by(Player.nickname).all():
@@ -187,7 +206,7 @@ def list_players(
             continue
         if max_rating is not None and (rating is None or rating > max_rating):
             continue
-        result.append(_player_out(player, rating, cluster_label))
+        result.append(_player_out(player, rating, cluster_label, below_threshold.get(player.id, False)))
     return result
 
 
@@ -247,6 +266,7 @@ def team_optimize(payload: TeamOptimizeRequest, db: Session = Depends(get_db)) -
     if result.feasible:
         ratings = latest_ratings(db, payload.game)
         clusters = latest_clusters(db, payload.game) if payload.game == "cs2" else {}
+        below_threshold = _below_pool_threshold_flags(db, payload.game)
         for player_id in result.player_ids:
             player = db.get(Player, player_id)
             team.append(
@@ -256,6 +276,7 @@ def team_optimize(payload: TeamOptimizeRequest, db: Session = Depends(get_db)) -
                     rating=ratings.get(player_id, 0.0),
                     role=player.role,
                     cluster_label=clusters.get(player_id),
+                    below_pool_threshold=below_threshold.get(player_id, False),
                 )
             )
 

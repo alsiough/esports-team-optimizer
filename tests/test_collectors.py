@@ -7,14 +7,17 @@
 
 from __future__ import annotations
 
+import logging
+
 import httpx
 import pytest
 
+import app.scheduler as scheduler
 from app.collectors.base import SourceUnavailableError
 from app.collectors.faceit import FaceitCollector
 from app.collectors.opendota import OpenDotaCollector
-from app.models import Player
-from app.scheduler import ingest
+from app.models import Player, PlayerSnapshot
+from app.scheduler import BELOW_POOL_THRESHOLD_KEY, ingest, ingest_dota2
 
 
 def _install_mock_transport(monkeypatch: pytest.MonkeyPatch, handler) -> None:
@@ -205,3 +208,109 @@ class TestIngestSkipsAllZeroSnapshot:
             normalize_snapshot=lambda raw: {"metrics": {"winrate": 0.5, "kda": 0.0, "gpm": 0.0}, "role": None},
         )
         assert stored == 1
+
+
+# lane_role/gold_per_min, при которых normalize._determine_role() выдаёт нужную
+# роль - см. tests/test_normalize.py::TestNormalizeOpenDotaSnapshot для той же
+# логики по отдельности
+_ROLE_MATCH = {
+    "1": {"lane_role": 1, "gold_per_min": 500},  # safe, core
+    "2": {"lane_role": 2, "gold_per_min": 500},  # mid
+    "3": {"lane_role": 3, "gold_per_min": 500},  # off, core
+    "4": {"lane_role": 3, "gold_per_min": 100},  # off, support
+    "5": {"lane_role": 1, "gold_per_min": 100},  # safe, support
+}
+
+
+class _RoleAwareOpenDotaCollector:
+    """Фейковый OpenDota-коллектор без сети: каждому account_id заранее
+    назначена желаемая роль через role_by_id (dict сохраняет порядок вставки -
+    это и есть порядок пула, как будто отдаёт /proPlayers)."""
+
+    game = "dota2"
+
+    def __init__(self, role_by_id: dict[str, str]):
+        self._role_by_id = role_by_id
+        self.fetched_ids: list[str] = []
+
+    def fetch_player_pool(self):
+        return [{"account_id": aid, "name": f"p{aid}", "team_name": None} for aid in self._role_by_id]
+
+    def fetch_player_stats(self, external_id):
+        self.fetched_ids.append(external_id)
+        match = _ROLE_MATCH[self._role_by_id[external_id]]
+        return {
+            "wl": {"win": 5, "lose": 5},
+            "totals": [
+                {"field": "kills", "n": 1, "sum": 5},
+                {"field": "deaths", "n": 1, "sum": 5},
+                {"field": "assists", "n": 1, "sum": 5},
+                {"field": "gold_per_min", "n": 1, "sum": 500},
+                {"field": "xp_per_min", "n": 1, "sum": 500},
+                {"field": "hero_damage", "n": 1, "sum": 10000},
+            ],
+            "matches": [match] * 3,
+        }
+
+
+class TestIngestDota2RoleBackfill:
+    """Регресс: optimize_team() гарантированно Infeasible, если у роли 0
+    кандидатов (см. ToDoList.md, 2026-08-10) - ingest_dota2() должен добирать
+    недостающие роли за пределами обычного среза пула (ТЗ 5.5)."""
+
+    def test_backfills_missing_role_from_extended_pool(self, db_session, monkeypatch):
+        monkeypatch.setattr(scheduler, "MIN_CANDIDATES_PER_ROLE", 1)
+        role_by_id = {
+            "1": "1",
+            "2": "3",
+            "3": "4",
+            "4": "5",  # первые 4 (primary) - роли "2" среди них нет
+            "5": "2",  # extended - закрывает недостающую роль "2"
+            "6": "1",  # extended - уже не нужен, не должен опрашиваться
+        }
+        collector = _RoleAwareOpenDotaCollector(role_by_id)
+
+        stored = ingest_dota2(db_session, collector=collector, pool_limit=4)
+
+        assert stored == 5
+        assert collector.fetched_ids == ["1", "2", "3", "4", "5"]  # "6" не тронут
+
+        roles = {p.role for p in db_session.query(Player).filter(Player.game == "dota2").all()}
+        assert roles == {"1", "2", "3", "4", "5"}
+
+        backfilled = db_session.query(Player).filter_by(game="dota2", external_id="5").one()
+        backfilled_snapshot = db_session.query(PlayerSnapshot).filter_by(player_id=backfilled.id).one()
+        assert backfilled_snapshot.metrics[BELOW_POOL_THRESHOLD_KEY] is True
+
+        primary = db_session.query(Player).filter_by(game="dota2", external_id="1").one()
+        primary_snapshot = db_session.query(PlayerSnapshot).filter_by(player_id=primary.id).one()
+        assert BELOW_POOL_THRESHOLD_KEY not in primary_snapshot.metrics
+
+    def test_no_backfill_when_roles_already_covered(self, db_session, monkeypatch):
+        monkeypatch.setattr(scheduler, "MIN_CANDIDATES_PER_ROLE", 1)
+        role_by_id = {"1": "2", "2": "3", "3": "4", "4": "5", "5": "1", "6": "1"}
+        collector = _RoleAwareOpenDotaCollector(role_by_id)
+
+        stored = ingest_dota2(db_session, collector=collector, pool_limit=5)
+
+        assert stored == 5
+        assert "6" not in collector.fetched_ids  # extended не опрашивался - роли уже покрыты
+
+    def test_logs_warning_when_role_stays_missing_after_backfill(self, db_session, monkeypatch, caplog):
+        monkeypatch.setattr(scheduler, "MIN_CANDIDATES_PER_ROLE", 1)
+        monkeypatch.setattr(scheduler, "DOTA2_ROLE_BACKFILL_LIMIT", 2)
+        role_by_id = {
+            "1": "1",
+            "2": "3",
+            "3": "4",
+            "4": "5",  # primary - роли "2" нет
+            "5": "1",
+            "6": "1",  # extended - роли "2" тоже нет
+        }
+        collector = _RoleAwareOpenDotaCollector(role_by_id)
+
+        with caplog.at_level(logging.WARNING, logger="app.scheduler"):
+            stored = ingest_dota2(db_session, collector=collector, pool_limit=4)
+
+        assert stored == 6  # все сохранены, просто роль "2" так и не набралась
+        assert any("2" in record.getMessage() for record in caplog.records if "добрать" in record.getMessage())

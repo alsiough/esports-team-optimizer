@@ -32,6 +32,12 @@ logger = logging.getLogger(__name__)
 NormalizePlayerFn = Callable[[dict[str, Any]], dict[str, Any] | None]
 NormalizeSnapshotFn = Callable[[dict[str, Any]], dict[str, Any]]
 
+# Ключ в PlayerSnapshot.metrics, которым помечаются кандидаты, добавленные в
+# пул донабором роли (см. ingest_dota2/_backfill_missing_roles) сверх
+# обычного среза DOTA2_POOL_LIMIT - индикатор "этот игрок ниже обычной
+# границы отбора пула, взят принудительно, чтобы закрыть недостающую роль".
+BELOW_POOL_THRESHOLD_KEY = "below_pool_threshold"
+
 
 def _get_or_create_player(
     session: Session, *, game: str, external_id: str, nickname: str, team: str | None
@@ -46,6 +52,82 @@ def _get_or_create_player(
         player.team = team
         player.last_seen = now
     return player
+
+
+@dataclass
+class _IngestOutcome:
+    stored: bool
+    role: str | None
+
+
+def _ingest_entry(
+    session: Session,
+    *,
+    game: str,
+    collector: BaseCollector,
+    normalize_player: NormalizePlayerFn,
+    normalize_snapshot: NormalizeSnapshotFn,
+    raw_entry: dict[str, Any],
+    extra_metrics: dict[str, Any] | None = None,
+) -> _IngestOutcome:
+    """Обрабатывает одного кандидата из пула: тянет статистику, нормализует,
+    пишет снапшот (если данные не деградировавшие). extra_metrics подмешивается
+    в metrics снапшота как есть - используется для пометки BELOW_POOL_THRESHOLD_KEY
+    при донаборе роли (см. ingest_dota2)."""
+    identity = normalize_player(raw_entry)
+    if identity is None:
+        return _IngestOutcome(stored=False, role=None)
+
+    try:
+        raw_stats = collector.fetch_player_stats(identity["external_id"])
+    except (SourceUnavailableError, httpx.HTTPError) as exc:
+        logger.warning("%s: пропуск игрока %s: %s", game, identity["external_id"], exc)
+        return _IngestOutcome(stored=False, role=None)
+
+    snapshot = normalize_snapshot(raw_stats)
+    if all(value == 0 for value in snapshot["metrics"].values()):
+        # normalize.py осознанно возвращает 0.0 на каждый показатель,
+        # когда у источника нет данных по игроку (нет матчей/totals у
+        # OpenDota, пустой lifetime у FACEIT) - это "нет сигнала", а не
+        # реальный игровой стиль. Такой снапшот не пишем: один подобный
+        # ряд полностью ломает KMeans-кластеризацию (см. ToDoList.md,
+        # запись 2026-08-10) - он на порядки дальше от остальных точек
+        # в масштабированном пространстве признаков, чем они друг от
+        # друга, и силуэт находит "оптимальным" выделить его в отдельный
+        # кластер, свалив всех остальных игроков в один.
+        logger.warning(
+            "%s: пропуск игрока %s - все метрики нулевые (нет данных источника)",
+            game,
+            identity["external_id"],
+        )
+        return _IngestOutcome(stored=False, role=None)
+
+    player = _get_or_create_player(
+        session,
+        game=game,
+        external_id=identity["external_id"],
+        nickname=identity["nickname"],
+        team=identity["team"],
+    )
+    if snapshot["role"] is not None:
+        player.role = str(snapshot["role"])
+    session.flush()
+
+    metrics = {**snapshot["metrics"], **(extra_metrics or {})}
+    session.add(
+        PlayerSnapshot(
+            player_id=player.id,
+            taken_at=dt.datetime.now(dt.timezone.utc),
+            metrics=metrics,
+        )
+    )
+    # Коммит на каждого игрока, а не один раз в конце цикла: иначе
+    # write-транзакция остаётся открытой на всё время опроса пула
+    # (десятки сетевых запросов к внешнему API), и параллельный job
+    # другой игры (см. scheduler.create_scheduler) гарантированно
+    # ловит "database is locked" на SQLite, а не просто ждёт.
+    session.commit()
+    return _IngestOutcome(stored=True, role=player.role)
 
 
 def ingest(
@@ -69,74 +151,109 @@ def ingest(
 
     stored = 0
     for raw_entry in pool:
-        identity = normalize_player(raw_entry)
-        if identity is None:
-            continue
-
-        try:
-            raw_stats = collector.fetch_player_stats(identity["external_id"])
-        except (SourceUnavailableError, httpx.HTTPError) as exc:
-            logger.warning("%s: пропуск игрока %s: %s", game, identity["external_id"], exc)
-            continue
-
-        snapshot = normalize_snapshot(raw_stats)
-        if all(value == 0 for value in snapshot["metrics"].values()):
-            # normalize.py осознанно возвращает 0.0 на каждый показатель,
-            # когда у источника нет данных по игроку (нет матчей/totals у
-            # OpenDota, пустой lifetime у FACEIT) - это "нет сигнала", а не
-            # реальный игровой стиль. Такой снапшот не пишем: один подобный
-            # ряд полностью ломает KMeans-кластеризацию (см. ToDoList.md,
-            # запись 2026-08-10) - он на порядки дальше от остальных точек
-            # в масштабированном пространстве признаков, чем они друг от
-            # друга, и силуэт находит "оптимальным" выделить его в отдельный
-            # кластер, свалив всех остальных игроков в один.
-            logger.warning(
-                "%s: пропуск игрока %s - все метрики нулевые (нет данных источника)",
-                game,
-                identity["external_id"],
-            )
-            continue
-
-        player = _get_or_create_player(
+        outcome = _ingest_entry(
             session,
             game=game,
-            external_id=identity["external_id"],
-            nickname=identity["nickname"],
-            team=identity["team"],
+            collector=collector,
+            normalize_player=normalize_player,
+            normalize_snapshot=normalize_snapshot,
+            raw_entry=raw_entry,
         )
-        if snapshot["role"] is not None:
-            player.role = str(snapshot["role"])
-        session.flush()
+        if outcome.stored:
+            stored += 1
 
-        session.add(
-            PlayerSnapshot(
-                player_id=player.id,
-                taken_at=dt.datetime.now(dt.timezone.utc),
-                metrics=snapshot["metrics"],
-            )
+    return stored
+
+
+DOTA2_ROLES = ("1", "2", "3", "4", "5")
+# По ТЗ 5.5 optimize_team() требует ровно одного кандидата на каждую роль
+# 1-5 - при нуле кандидатов на роль результат гарантированно Infeasible
+# независимо от team_size/active_days (см. ToDoList.md, запись 2026-08-10).
+# Требуем не 1, а MIN_CANDIDATES_PER_ROLE - запас на случай, если часть
+# кандидатов позже отсеется фильтром active_days в оптимизаторе.
+MIN_CANDIDATES_PER_ROLE = int(os.getenv("DOTA2_MIN_CANDIDATES_PER_ROLE", "3"))
+# Сколько дополнительных кандидатов сверх DOTA2_POOL_LIMIT можно опросить в
+# попытке добрать недостающие роли - жёсткая граница бюджета OpenDota,
+# иначе при неудачном донаборе можно уйти в сканирование всего /proPlayers.
+DOTA2_ROLE_BACKFILL_LIMIT = int(os.getenv("DOTA2_ROLE_BACKFILL_LIMIT", "60"))
+
+
+def _backfill_missing_roles(
+    session: Session,
+    collector: OpenDotaCollector,
+    candidates: list[dict[str, Any]],
+    role_counts: dict[str, int],
+) -> int:
+    """Донабирает кандидатов за пределами обычного среза пула, пока не
+    наберётся MIN_CANDIDATES_PER_ROLE на каждую роль (или не кончится
+    candidates/DOTA2_ROLE_BACKFILL_LIMIT). Кандидаты, добавленные так,
+    помечаются BELOW_POOL_THRESHOLD_KEY - они не попали в обычный срез пула
+    по позиции в /proPlayers, но нужны для гарантии покрытия ролей."""
+    missing = {r for r in DOTA2_ROLES if role_counts[r] < MIN_CANDIDATES_PER_ROLE}
+    stored = 0
+    for raw_entry in candidates[:DOTA2_ROLE_BACKFILL_LIMIT]:
+        if not missing:
+            break
+        outcome = _ingest_entry(
+            session,
+            game="dota2",
+            collector=collector,
+            normalize_player=normalize_opendota_player,
+            normalize_snapshot=normalize_opendota_snapshot,
+            raw_entry=raw_entry,
+            extra_metrics={BELOW_POOL_THRESHOLD_KEY: True},
         )
-        # Коммит на каждого игрока, а не один раз в конце цикла: иначе
-        # write-транзакция остаётся открытой на всё время опроса пула
-        # (десятки сетевых запросов к внешнему API), и параллельный job
-        # другой игры (см. scheduler.create_scheduler) гарантированно
-        # ловит "database is locked" на SQLite, а не просто ждёт.
-        session.commit()
-        stored += 1
+        if outcome.stored:
+            stored += 1
+            if outcome.role in role_counts:
+                role_counts[outcome.role] += 1
+                if role_counts[outcome.role] >= MIN_CANDIDATES_PER_ROLE:
+                    missing.discard(outcome.role)
 
+    if missing:
+        logger.warning(
+            "dota2: не удалось добрать минимум %s кандидатов на роли %s даже расширенным поиском (проверено до %s доп. кандидатов)",
+            MIN_CANDIDATES_PER_ROLE,
+            sorted(missing),
+            DOTA2_ROLE_BACKFILL_LIMIT,
+        )
     return stored
 
 
 def ingest_dota2(session: Session, collector: OpenDotaCollector | None = None, pool_limit: int | None = None) -> int:
     # OPENDOTA_API_KEY опционален (в отличие от FACEIT_API_KEY) - публичный
     # лимит и без ключа работает, ключ только поднимает лимиты (см. CLAUDE.md)
-    return ingest(
-        session,
-        game="dota2",
-        collector=collector or OpenDotaCollector(api_key=os.getenv("OPENDOTA_API_KEY")),
-        normalize_player=normalize_opendota_player,
-        normalize_snapshot=normalize_opendota_snapshot,
-        pool_limit=pool_limit,
-    )
+    collector = collector or OpenDotaCollector(api_key=os.getenv("OPENDOTA_API_KEY"))
+    limit = DOTA2_POOL_LIMIT if pool_limit is None else pool_limit
+
+    try:
+        pool = collector.fetch_player_pool()
+    except SourceUnavailableError as exc:
+        logger.error("dota2: пул игроков недоступен: %s", exc)
+        return 0
+
+    primary, extended = pool[:limit], pool[limit:]
+
+    stored = 0
+    role_counts: dict[str, int] = {r: 0 for r in DOTA2_ROLES}
+    for raw_entry in primary:
+        outcome = _ingest_entry(
+            session,
+            game="dota2",
+            collector=collector,
+            normalize_player=normalize_opendota_player,
+            normalize_snapshot=normalize_opendota_snapshot,
+            raw_entry=raw_entry,
+        )
+        if outcome.stored:
+            stored += 1
+            if outcome.role in role_counts:
+                role_counts[outcome.role] += 1
+
+    if any(role_counts[r] < MIN_CANDIDATES_PER_ROLE for r in DOTA2_ROLES) and extended:
+        stored += _backfill_missing_roles(session, collector, extended, role_counts)
+
+    return stored
 
 
 def ingest_cs2(session: Session, collector: FaceitCollector, pool_limit: int | None = None) -> int:

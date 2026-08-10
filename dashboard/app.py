@@ -28,8 +28,8 @@ from app.optimizer import (
     TEAM_SIZE,
     optimize_team,
 )
-from app.rating import latest_ratings
-from app.scheduler import refresh_game
+from app.rating import latest_ratings, latest_snapshots
+from app.scheduler import BELOW_POOL_THRESHOLD_KEY, refresh_game
 
 GAMES = ("dota2", "cs2")
 GAME_LABELS = {"dota2": "Dota 2", "cs2": "CS2"}
@@ -69,6 +69,9 @@ if st.sidebar.button("Опросить источник сейчас"):
 
 ratings = latest_ratings(session, game)
 clusters = latest_clusters(session, game)
+below_threshold = {
+    player.id: bool(snapshot.metrics.get(BELOW_POOL_THRESHOLD_KEY)) for player, snapshot in latest_snapshots(session, game)
+}
 players = session.query(Player).filter(Player.game == game).order_by(Player.nickname).all()
 
 players_df = pd.DataFrame(
@@ -81,6 +84,7 @@ players_df = pd.DataFrame(
             "cluster": clusters.get(p.id),
             "rating": ratings.get(p.id),
             "last_seen": p.last_seen,
+            "⚠ ниже порога пула": below_threshold.get(p.id, False),
         }
         for p in players
     ]
@@ -90,6 +94,11 @@ st.header("Игроки")
 if players_df.empty:
     st.info("Игроков для этой игры пока нет — опросите источник.")
 else:
+    if game == "dota2" and players_df["⚠ ниже порога пула"].any():
+        st.caption(
+            "⚠ ниже порога пула — игрок добавлен принудительным донабором роли "
+            "(см. app/scheduler.py::_backfill_missing_roles), не попал в обычный срез пула по позиции в /proPlayers."
+        )
     filter_col1, filter_col2, filter_col3 = st.columns(3)
     with filter_col1:
         cluster_options = sorted(int(c) for c in players_df["cluster"].dropna().unique())
@@ -172,6 +181,7 @@ if submitted:
                     "role": session.get(Player, pid).role,
                     "cluster": clusters.get(pid),
                     "rating": ratings.get(pid),
+                    "⚠ ниже порога пула": below_threshold.get(pid, False),
                 }
                 for pid in result.player_ids
             ]

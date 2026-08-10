@@ -22,7 +22,7 @@ GAME_WEIGHTS = {"dota2": DOTA2_WEIGHTS, "cs2": CS2_WEIGHTS}
 GAME_GROUP_FIELD = {"dota2": "role", "cs2": None}
 
 
-def _latest_snapshots(session: Session, game: str) -> list[tuple[Player, PlayerSnapshot]]:
+def latest_snapshots(session: Session, game: str) -> list[tuple[Player, PlayerSnapshot]]:
     latest_per_player = (
         session.query(
             PlayerSnapshot.player_id,
@@ -99,7 +99,7 @@ def compute_ratings(session: Session, game: str, rating_version: str = RATING_VE
     if weights is None:
         raise ValueError(f"неизвестная игра: {game}")
 
-    rows = _latest_snapshots(session, game)
+    rows = latest_snapshots(session, game)
     if not rows:
         return 0
 
