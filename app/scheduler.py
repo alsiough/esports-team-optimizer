@@ -98,9 +98,14 @@ def ingest(
                 metrics=snapshot["metrics"],
             )
         )
+        # Коммит на каждого игрока, а не один раз в конце цикла: иначе
+        # write-транзакция остаётся открытой на всё время опроса пула
+        # (десятки сетевых запросов к внешнему API), и параллельный job
+        # другой игры (см. scheduler.create_scheduler) гарантированно
+        # ловит "database is locked" на SQLite, а не просто ждёт.
+        session.commit()
         stored += 1
 
-    session.commit()
     return stored
 
 
