@@ -365,11 +365,36 @@ def _job_ingest_cs2() -> None:
         session.close()
 
 
+# Кластеризация не пересчитывается на каждом ingest-job'е (см. комментарии
+# внутри _job_ingest_dota2/_job_ingest_cs2) - она заметно тяжелее одного
+# опроса (KMeans перебирает k=2..8 с n_init=10 на каждый) и не обязана
+# поспевать за каждым коротким интервалом. Но без ПЕРИОДИЧЕСКОГО пересчёта
+# кластеры бесконечно отстают от новых игроков - на практике застряли на
+# 27 дней, и 66 из 197 cs2-игроков вообще ни разу не кластеризовались (см.
+# ToDoList.md, 2026-08-10). Поэтому - отдельный job с более длинным
+# интервалом, а не на каждом цикле ingest.
+CLUSTER_RECOMPUTE_INTERVAL_MINUTES = int(os.getenv("CLUSTER_RECOMPUTE_INTERVAL_MINUTES", "360"))
+
+
+def _job_recompute_clusters() -> None:
+    session = get_session()
+    try:
+        for game in ("dota2", "cs2"):
+            clustered = compute_clusters(session, game)
+            logger.info("%s: кластеры пересчитаны для %s игроков", game, clustered)
+    except Exception:
+        logger.exception("recompute_clusters: job упал с ошибкой")
+    finally:
+        session.close()
+
+
 def create_scheduler() -> BackgroundScheduler:
-    """Собирает BackgroundScheduler с job'ами опроса обоих источников. Не запускает - вызывающий код сам решает, когда start()/shutdown()."""
+    """Собирает BackgroundScheduler с job'ами опроса обоих источников и
+    периодического пересчёта кластеров. Не запускает - вызывающий код сам
+    решает, когда start()/shutdown()."""
     scheduler = BackgroundScheduler(
         timezone="UTC",
-        executors={"default": ThreadPoolExecutor(max_workers=2)},
+        executors={"default": ThreadPoolExecutor(max_workers=3)},
     )
     now = dt.datetime.now(dt.timezone.utc)
     scheduler.add_job(
@@ -384,6 +409,14 @@ def create_scheduler() -> BackgroundScheduler:
         _job_ingest_cs2,
         trigger=IntervalTrigger(minutes=CS2_POLL_INTERVAL_MINUTES),
         id="ingest_cs2",
+        next_run_time=now,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        _job_recompute_clusters,
+        trigger=IntervalTrigger(minutes=CLUSTER_RECOMPUTE_INTERVAL_MINUTES),
+        id="recompute_clusters",
         next_run_time=now,
         max_instances=1,
         coalesce=True,
