@@ -57,3 +57,32 @@ def test_compute_clusters_separates_two_distinct_groups(db_session):
     assert len(strong_labels) == 1
     assert len(weak_labels) == 1
     assert strong_labels != weak_labels
+
+
+def test_compute_clusters_excludes_all_zero_degenerate_player(db_session):
+    """Регресс: игрок без данных источника (все метрики 0.0) на реальных
+    данных полностью ломал KMeans - силуэт выделял его в отдельный кластер,
+    а все настоящие игроки сваливались в один (см. ToDoList.md, 2026-08-10).
+    """
+
+    def jitter(base: dict, i: int) -> dict:
+        return {k: v + i * 0.01 for k, v in base.items()}
+
+    strong = {"winrate": 0.8, "kd": 1.8, "adr": 100.0, "hs_pct": 0.6}
+    weak = {"winrate": 0.2, "kd": 0.5, "adr": 40.0, "hs_pct": 0.2}
+    strong_players = [_add_player(db_session, external_id=f"strong-{i}", metrics=jitter(strong, i)) for i in range(4)]
+    weak_players = [_add_player(db_session, external_id=f"weak-{i}", metrics=jitter(weak, i)) for i in range(4)]
+    degenerate = _add_player(
+        db_session, external_id="no-data", metrics={"winrate": 0.0, "kd": 0.0, "adr": 0.0, "hs_pct": 0.0}
+    )
+
+    clustered = compute_clusters(db_session, "cs2")
+    assert clustered == 8  # без "no-data" игрока
+
+    labels = latest_clusters(db_session, "cs2")
+    assert degenerate.id not in labels
+    strong_labels = {labels[p.id] for p in strong_players}
+    weak_labels = {labels[p.id] for p in weak_players}
+    assert len(strong_labels) == 1
+    assert len(weak_labels) == 1
+    assert strong_labels != weak_labels

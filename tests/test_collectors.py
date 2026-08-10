@@ -13,6 +13,7 @@ import pytest
 from app.collectors.base import SourceUnavailableError
 from app.collectors.faceit import FaceitCollector
 from app.collectors.opendota import OpenDotaCollector
+from app.models import Player
 from app.scheduler import ingest
 
 
@@ -165,3 +166,42 @@ class TestIngestEmptyPool:
             normalize_snapshot=lambda raw: raw,
         )
         assert stored == 0
+
+
+class _OnePlayerCollector:
+    game = "dota2"
+
+    def fetch_player_pool(self):
+        return [{"external_id": "1", "nickname": "NoData", "team": None}]
+
+    def fetch_player_stats(self, external_id):
+        return {}  # источник не вернул данных по игроку
+
+
+class TestIngestSkipsAllZeroSnapshot:
+    """Снапшот, где все метрики нулевые ("нет данных источника" в normalize.py -
+    см. _totals_avg/_winrate/normalize_faceit_snapshot), не должен попадать в БД:
+    один такой ряд ломает KMeans-кластеризацию (см. clustering.py)."""
+
+    def test_all_zero_metrics_not_stored(self, db_session):
+        stored = ingest(
+            db_session,
+            game="dota2",
+            collector=_OnePlayerCollector(),
+            normalize_player=lambda raw: raw,
+            normalize_snapshot=lambda raw: {"metrics": {"winrate": 0.0, "kda": 0.0, "gpm": 0.0}, "role": None},
+        )
+        assert stored == 0
+        assert db_session.query(Player).count() == 0
+
+    def test_partial_zero_metrics_still_stored(self, db_session):
+        # только полностью нулевой набор - сигнал "нет данных"; частично
+        # нулевые метрики (например, реальный 0% хедшотов) - обычные данные
+        stored = ingest(
+            db_session,
+            game="dota2",
+            collector=_OnePlayerCollector(),
+            normalize_player=lambda raw: raw,
+            normalize_snapshot=lambda raw: {"metrics": {"winrate": 0.5, "kda": 0.0, "gpm": 0.0}, "role": None},
+        )
+        assert stored == 1

@@ -39,7 +39,16 @@ def _feature_table(session: Session, game: str, lookback_days: int) -> pd.DataFr
         if col not in df.columns:
             df[col] = 0.0
         df[col] = df[col].fillna(0.0)
-    return df.groupby("player_id", as_index=False)[features].mean()
+    grouped = df.groupby("player_id", as_index=False)[features].mean()
+
+    # Защита от уже существующих в БД "нулевых" снапшотов (см. scheduler.py::ingest,
+    # который такие больше не пишет, но исторические/ручные данные могли остаться) -
+    # один игрок без единого реального показателя доминирует над расстояниями в
+    # масштабированном пространстве и ломает и KMeans (compute_clusters), и PCA
+    # (pca_2d): вместо реальных стилей игры получается "выброс отдельно, все
+    # остальные одним комком" - см. ToDoList.md, запись 2026-08-10.
+    degenerate = (grouped[features] == 0).all(axis=1)
+    return grouped[~degenerate].reset_index(drop=True)
 
 
 def _scaled_features(df: pd.DataFrame, features: list[str]) -> np.ndarray:
